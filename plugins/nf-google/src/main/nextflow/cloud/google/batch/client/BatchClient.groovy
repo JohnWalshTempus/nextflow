@@ -174,8 +174,34 @@ class BatchClient {
     }
 
     /**
+     * Determine whether the given error should be retried. The whole cause chain is inspected
+     * because a transient failure can be nested more than one level deep, e.g. a Compute Engine
+     * metadata server error while refreshing the credentials is surfaced as an
+     * {@code UnauthenticatedException} caused by a {@code StatusRuntimeException} caused by
+     * the underlying {@code IOException}
+     *
+     * @param error The {@link java.lang.Throwable} to be evaluated
+     * @return {@code true} if the error is considered transient and the action can be retried
+     */
+    protected boolean retryCondition(Throwable error) {
+        for( Throwable t=error; t!=null; t=(t.cause!=t ? t.cause : null) ) {
+            if( t instanceof UnavailableException )
+                return true
+            if( t instanceof DeadlineExceededException )
+                return true
+            if( t instanceof NotFoundException )
+                return true
+            if( t instanceof IOException )
+                return true
+            if( t instanceof TimeoutException )
+                return true
+        }
+        return false
+    }
+
+    /**
      * Carry out the invocation of the specified action using a retry policy
-     * when an API UnavailableException is thrown
+     * when a transient API error is thrown
      *
      * see also https://github.com/nextflow-io/nextflow/issues/4537
      *
@@ -187,17 +213,7 @@ class BatchClient {
         final cond = new CheckedPredicate<? extends Throwable>() {
             @Override
             boolean test(Throwable t) {
-                if( t instanceof UnavailableException )
-                    return true
-                if( t instanceof DeadlineExceededException )
-                    return true
-                if( t instanceof IOException || t.cause instanceof IOException )
-                    return true
-                if( t instanceof TimeoutException || t.cause instanceof TimeoutException )
-                    return true
-                if( t instanceof NotFoundException || t.cause instanceof NotFoundException )
-                    return true
-                return false
+                return retryCondition(t)
             }
         }
         // create the retry policy object

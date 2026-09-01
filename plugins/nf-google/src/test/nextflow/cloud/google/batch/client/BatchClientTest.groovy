@@ -15,10 +15,22 @@
  */
 package nextflow.cloud.google.batch.client
 
+import java.util.concurrent.TimeoutException
+
+import com.google.api.gax.grpc.GrpcStatusCode
+import com.google.api.gax.rpc.DeadlineExceededException
+import com.google.api.gax.rpc.NotFoundException
+import com.google.api.gax.rpc.PermissionDeniedException
+import com.google.api.gax.rpc.UnauthenticatedException
+import com.google.api.gax.rpc.UnavailableException
 import com.google.cloud.batch.v1.Task
 import com.google.cloud.batch.v1.TaskName
 import com.google.cloud.batch.v1.TaskStatus
+import io.grpc.Status
+import io.grpc.StatusRuntimeException
+import nextflow.cloud.google.GoogleOpts
 import spock.lang.Specification
+import spock.lang.Unroll
 
 /**
  *
@@ -73,6 +85,112 @@ class BatchClientTest extends Specification{
         Task.newBuilder().setName(name)
             .setStatus(TaskStatus.newBuilder().setState(state).build())
             .build()
+    }
+
+    @Unroll
+    def 'should determine retry condition for #ERROR' () {
+        given:
+        def client = new BatchClient()
+
+        expect:
+        client.retryCondition(ERROR) == EXPECTED
+
+        where:
+        ERROR                                           | EXPECTED
+        new IOException('io error')                     | true
+        new TimeoutException('timeout')                 | true
+        unavailable()                                   | true
+        deadlineExceeded()                              | true
+        notFound()                                      | true
+        new RuntimeException('nope')                    | false
+        permissionDenied()                              | false
+        new RuntimeException('nope', new RuntimeException('nope')) | false
+        new RuntimeException('wrap', new IOException()) | true
+    }
+
+    def 'should retry an IO error nested in the cause chain' () {
+        given:
+        def client = new BatchClient()
+        and: 'the error reported when the metadata server fails to refresh the credentials'
+        def root = new IOException('Unexpected Error code 500 trying to get security access token from Compute Engine metadata for the default service account')
+        def grpc = Status.UNAUTHENTICATED.withDescription('Failed computing credential metadata').withCause(root).asRuntimeException()
+        def err = new UnauthenticatedException(grpc, GrpcStatusCode.of(Status.Code.UNAUTHENTICATED), false)
+
+        expect: 'the IO error is two levels deep and must still be detected'
+        !IOException.isInstance(err.cause)
+        and:
+        client.retryCondition(err)
+    }
+
+    def 'should retry the action when the credentials refresh fails transiently' () {
+        given:
+        def client = new BatchClient(config: new GoogleOpts([batch: [retryPolicy: [maxAttempts: 3, delay: '1ms', maxDelay: '10ms']]]))
+        and:
+        def attempts = 0
+
+        when:
+        def result = client.apply(() -> {
+            attempts++
+            if( attempts < 3 )
+                throw unauthenticatedCausedByIO()
+            return 'done'
+        })
+
+        then:
+        result == 'done'
+        attempts == 3
+    }
+
+    def 'should give up after the max attempts are exhausted' () {
+        given:
+        def client = new BatchClient(config: new GoogleOpts([batch: [retryPolicy: [maxAttempts: 2, delay: '1ms', maxDelay: '10ms']]]))
+        and:
+        def attempts = 0
+
+        when:
+        client.apply(() -> { attempts++; throw unauthenticatedCausedByIO() })
+
+        then:
+        thrown(UnauthenticatedException)
+        attempts == 2
+    }
+
+    def 'should not retry a non-transient error' () {
+        given:
+        def client = new BatchClient(config: new GoogleOpts([batch: [retryPolicy: [maxAttempts: 5, delay: '1ms', maxDelay: '10ms']]]))
+        and:
+        def attempts = 0
+
+        when:
+        client.apply(() -> { attempts++; throw permissionDenied() })
+
+        then:
+        thrown(PermissionDeniedException)
+        attempts == 1
+    }
+
+    static private UnauthenticatedException unauthenticatedCausedByIO() {
+        final grpc = Status.UNAUTHENTICATED
+                .withDescription('Failed computing credential metadata')
+                .withCause(new IOException('Unexpected Error code 500'))
+                .asRuntimeException()
+        return new UnauthenticatedException(grpc, GrpcStatusCode.of(Status.Code.UNAUTHENTICATED), false)
+    }
+
+    static private UnavailableException unavailable() {
+        new UnavailableException(new StatusRuntimeException(Status.UNAVAILABLE), GrpcStatusCode.of(Status.Code.UNAVAILABLE), true)
+    }
+
+    static private DeadlineExceededException deadlineExceeded() {
+        new DeadlineExceededException(new StatusRuntimeException(Status.DEADLINE_EXCEEDED), GrpcStatusCode.of(Status.Code.DEADLINE_EXCEEDED), true)
+    }
+
+    static private NotFoundException notFound() {
+        new NotFoundException(new StatusRuntimeException(Status.NOT_FOUND), GrpcStatusCode.of(Status.Code.NOT_FOUND), false)
+    }
+
+    static private PermissionDeniedException permissionDenied() {
+        new PermissionDeniedException(new StatusRuntimeException(Status.PERMISSION_DENIED), GrpcStatusCode.of(Status.Code.PERMISSION_DENIED), false)
     }
 
 }
